@@ -1,6 +1,8 @@
-## knock: A port-knocking implementation
+## knock: A port-knocking implementation (with TOTP support)
 
 Copyright (c) 2004, Judd Vinet <jvinet@zeroflux.org>
+
+Updated with TOTP support 01/2024 by T Farrant - Modux Ltd.
 
 ### ABOUT  
 
