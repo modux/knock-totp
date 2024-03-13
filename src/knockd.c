@@ -16,6 +16,8 @@
  *  You should have received a copy of the GNU General Public License along
  *  with this program; if not, write to the Free Software Foundation, Inc.,
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
+ *
+ *  Updated to add TOTP support 01/2024 by T Farrant - Modux Ltd.
  */
 
 #if __APPLE__
@@ -57,17 +59,25 @@
 #include <pcap.h>
 #include <errno.h>
 #include "list.h"
+#include <math.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
 
 #if __APPLE__
 #undef daemon
 extern int daemon(int, int);
 #endif
 
-static char version[] = "0.8";
+static char version[] = "0.9";
 
 #define SEQ_TIMEOUT 25 /* default knock timeout in seconds */
 #define CMD_TIMEOUT 10 /* default timeout in seconds between start and stop commands */
 #define SEQ_MAX     32 /* maximum number of ports in a knock sequence */
+#define TS 30   /* time step in seconds, default value */
+#define T0 0
+#define DIGITS 6
+#define VALIDITY 30
+#define TIME 2
 
 typedef enum _flag_stat {
 	DONT_CARE,  /* 0 */
@@ -86,6 +96,7 @@ typedef struct opendoor {
 	char *start_command;
 	char *start_command6;
 	time_t cmd_timeout;
+	char *key;
 	char *stop_command;
 	char *stop_command6;
 	flag_stat flag_fin;
@@ -141,6 +152,20 @@ size_t parse_cmd(char *dest, size_t size, const char *command, const char *src);
 int exec_cmd(char *command, char *name);
 void sniff(u_char *arg, const struct pcap_pkthdr *hdr, const u_char *packet);
 int target_strcmp(char *ip, char *target);
+uint8_t *hmac(unsigned char *key, int kl, uint64_t interval);
+uint32_t DT(uint8_t *digest);
+uint32_t mod_hotp(uint32_t bin_code, int digits);
+uint32_t HOTP(uint8_t *key, size_t kl, uint64_t interval, int digits);
+time_t get_time(time_t t0);
+uint32_t TOTP(uint8_t *key, size_t kl, uint64_t time, int digits);
+uint32_t totp(uint8_t *k, size_t keylen);
+int validate_b32key(char *k, size_t len, size_t pos);
+size_t decode_b32key(uint8_t **k, size_t len);
+void split_number(uint32_t number, uint32_t *first, uint32_t *second);
+void split_number_string(uint32_t number, char *string);
+uint32_t generate_totp(char *secret);
+void alarm_handler(int sig);
+
 
 pcap_t *cap = NULL;
 FILE *logfd = NULL;
@@ -169,6 +194,11 @@ char o_logfile[PATH_MAX] = "";
 
 int main(int argc, char **argv)
 {
+    if (argc <= 1) {
+        fprintf(stderr, "Provide at least one argument\n");
+        return -1;
+    }
+
 	struct ifaddrs *ifaddr, *ifa;
 	ip_literal_t *myip;
 	char pcap_err[PCAP_ERRBUF_SIZE] = "";
@@ -338,6 +368,8 @@ int main(int argc, char **argv)
 	logprint("starting up, listening on %s", o_int);
 	ret = 1;
 	while(ret >= 0) {
+		alarm(1);
+		signal(SIGALRM, alarm_handler);
 		ret = pcap_dispatch(cap, -1, sniff, NULL);
 	}
 	dprint("bailed out of main loop! (ret=%d)\n", ret);
@@ -346,6 +378,246 @@ int main(int argc, char **argv)
 	cleanup(0);
 	/* notreached */
 	exit(0);
+}
+
+void alarm_handler(int sig)
+{
+    reload(0);
+	alarm(1);
+	signal(SIGALRM, alarm_handler);
+
+}
+
+// Generate a TOTP code from a base32 encoded secret
+uint32_t generate_totp(char *secret) {
+	size_t pos;
+	size_t len;
+	size_t keylen;
+	uint8_t *k;
+	uint32_t result;
+
+	len = strlen(secret);
+	if (validate_b32key(secret, len, pos) == 1) {
+		fprintf(stderr, "%s: invalid base32 secret\n", secret);
+		return -1;
+	}
+	k = (uint8_t *)secret;
+	keylen = decode_b32key(&k, len);
+
+	result = totp(k, keylen);
+	return result;
+}
+
+// Function to take a six digit number and split it into an array of two numbers e.g. 123456 -> [123, 456] or 012045 -> [12, 45]
+void split_number(uint32_t number, uint32_t *first, uint32_t *second) {
+	*first = number / 1000;
+	*second = number % 1000;
+}
+
+// Function to take a six digit number and split it into a string of two numbers separated by a comma e.g. 123456 -> 123,456 or 012045 -> 12,45
+void split_number_string(uint32_t number, char *string) {
+	uint32_t first, second;
+	split_number(number, &first, &second);
+	sprintf(string, "%u,%u", first, second);
+}
+
+
+static const int8_t base32_vals[256] = {
+    //    This map cheats and interprets:
+    //       - the numeral zero as the letter "O" as in oscar
+    //       - the numeral one as the letter "L" as in lima
+    //       - the numeral eight as the letter "B" as in bravo
+    // 00  01  02  03  04  05  06  07  08  09  0A  0B  0C  0D  0E  0F
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0x00
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0x10
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0x20
+    14, 11, 26, 27, 28, 29, 30, 31,  1, -1, -1, -1, -1,  0, -1, -1, // 0x30
+    -1,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, // 0x40
+    15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, -1, -1, -1, -1, -1, // 0x50
+    -1,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, // 0x60
+    15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, -1, -1, -1, -1, // 0x70
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0x80
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0x90
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0xA0
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0xB0
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0xC0
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0xD0
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0xE0
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, // 0xF0
+};
+
+// Function to validate a base32 key and return 0 if valid and 1 if invalid
+int validate_b32key(char *k, size_t len, size_t pos)
+{
+    // validates base32 key
+    if (((len & 0xF) != 0) && ((len & 0xF) != 8))
+        return 1;
+
+    for (pos = 0; (pos < len); pos++) {
+        if (base32_vals[k[pos]] == -1)
+            return 1;
+        if (k[pos] == '=') {
+            if (((pos & 0xF) == 0) || ((pos & 0xF) == 8))
+                return(1);
+            if ((len - pos) > 6)
+                return 1;
+            switch (pos % 8) {
+            case 2:
+            case 4:
+            case 5:
+            case 7:
+                break;
+            default:
+                return 1;
+            }
+            for ( ; (pos < len); pos++) {
+                if (k[pos] != '=')
+                    return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+// Function to decode a base32 key
+size_t decode_b32key(uint8_t **ki, size_t lenii)
+{
+
+    size_t keyleni;
+    size_t posi;
+    // decodes base32 secret key
+    keyleni = 0;
+
+    for (posi = 0; posi <= (lenii - 8); posi += 8) {
+		// MSB is Most Significant Bits  (0x80 == 10000000 ~= MSB)
+		// MB is middle bits             (0x7E == 01111110 ~= MB)
+		// LSB is Least Significant Bits (0x01 == 00000001 ~= LSB)
+
+		// byte 0
+		(*ki)[keyleni+0]  = (base32_vals[(*ki)[posi+0]] << 3) & 0xF8; // 5 MSB
+		(*ki)[keyleni+0] |= (base32_vals[(*ki)[posi+1]] >> 2) & 0x07; // 3 LSB
+
+		if ((*ki)[posi+2] == '=') {
+			keyleni += 1;
+			break;
+		}
+
+		// byte 1
+		(*ki)[keyleni+1]  = (base32_vals[(*ki)[posi+1]] << 6) & 0xC0; // 2 MSB
+		(*ki)[keyleni+1] |= (base32_vals[(*ki)[posi+2]] << 1) & 0x3E; // 5  MB
+		(*ki)[keyleni+1] |= (base32_vals[(*ki)[posi+3]] >> 4) & 0x01; // 1 LSB
+		if ((*ki)[posi+4] == '=') {
+			keyleni += 2;
+			break;
+		}
+
+		// byte 2
+		(*ki)[keyleni+2]  = (base32_vals[(*ki)[posi+3]] << 4) & 0xF0; // 4 MSB
+		(*ki)[keyleni+2] |= (base32_vals[(*ki)[posi+4]] >> 1) & 0x0F; // 4 LSB
+		if ((*ki)[posi+5] == '=') {
+			keyleni += 3;
+			break;
+		}
+
+		// byte 3
+		(*ki)[keyleni+3]  = (base32_vals[(*ki)[posi+4]] << 7) & 0x80; // 1 MSB
+		(*ki)[keyleni+3] |= (base32_vals[(*ki)[posi+5]] << 2) & 0x7C; // 5  MB
+		(*ki)[keyleni+3] |= (base32_vals[(*ki)[posi+6]] >> 3) & 0x03; // 2 LSB
+		if ((*ki)[posi+7] == '=') {
+			keyleni += 4;
+			break;
+		}
+
+		// byte 4
+		(*ki)[keyleni+4]  = (base32_vals[(*ki)[posi+6]] << 5) & 0xE0; // 3 MSB
+		(*ki)[keyleni+4] |= (base32_vals[(*ki)[posi+7]] >> 0) & 0x1F; // 5 LSB
+		keyleni += 5;
+    }
+
+    (*ki)[keyleni] = 0;
+
+    return keyleni;
+}
+
+// Function to get the current time in 30 second intervals
+time_t get_time(time_t t0)
+{
+    return floor((time(NULL) - t0) / TS);
+}
+
+// Function to generate a TOTP code from a base32 encoded secret
+uint32_t totp(uint8_t *k, size_t keylen)
+{
+    time_t t = floor((time(NULL) - T0) / VALIDITY);
+
+    return TOTP(k, keylen, t, DIGITS);
+}
+
+// Function to generate a TOTP code from a base32 encoded secret
+uint32_t TOTP(uint8_t *key, size_t kl, uint64_t time, int digits)
+{
+    uint32_t totp;
+
+    totp = HOTP(key, kl, time, digits);
+    return totp;
+}
+
+// Function to calculate the HMAC of a message
+uint8_t *hmac(unsigned char *key, int kl, uint64_t interval)
+{
+    return (uint8_t *)HMAC(EVP_sha1(), key, kl,
+            (const unsigned char *)&interval, sizeof(interval), NULL, 0);
+}
+
+uint32_t DT(uint8_t *digest)
+{
+    uint64_t offset;
+    uint32_t bin_code;
+
+    // dynamically truncates hash
+    offset   = digest[19] & 0x0f;
+
+    bin_code = (digest[offset]  & 0x7f) << 24
+        | (digest[offset+1] & 0xff) << 16
+        | (digest[offset+2] & 0xff) <<  8
+        | (digest[offset+3] & 0xff);
+
+    // truncates code to 6 digits
+
+    return bin_code;
+}
+
+uint32_t mod_hotp(uint32_t bin_code, int digits)
+{
+    int power = pow(10, digits);
+    uint32_t otp = bin_code % power;
+
+    return otp;
+}
+
+// Function to calculate the HOTP from a key and an interval
+uint32_t HOTP(uint8_t *key, size_t kl, uint64_t interval, int digits)
+{
+    uint8_t *digest;
+    uint32_t result;
+    uint32_t endianness;
+
+    endianness = 0xdeadbeef;
+    if ((*(const uint8_t *)&endianness) == 0xef) {
+        interval = ((interval & 0x00000000ffffffff) << 32) | ((interval & 0xffffffff00000000) >> 32);
+        interval = ((interval & 0x0000ffff0000ffff) << 16) | ((interval & 0xffff0000ffff0000) >> 16);
+        interval = ((interval & 0x00ff00ff00ff00ff) <<  8) | ((interval & 0xff00ff00ff00ff00) >>  8);
+    };
+
+    //First Phase, get the digest of the message using the provided key ...
+    digest = (uint8_t *)hmac(key, kl, interval);
+    //digest = (uint8_t *)HMAC(EVP_sha1(), key, kl, (const unsigned char *)&interval, sizeof(interval), NULL, 0);
+    //Second Phase, get the dbc from the algorithm
+    uint32_t dbc = DT(digest);
+    //Third Phase: calculate the mod_k of the dbc to get the correct number
+    result = mod_hotp(dbc, digits);
+
+    return result;
 }
 
 void dprint(char *fmt, ...)
@@ -613,6 +885,7 @@ int parseconfig(char *configfile)
 				door->start_command = NULL;
 				door->start_command6 = NULL;
 				door->cmd_timeout = CMD_TIMEOUT; /* default command timeout (seconds) */
+				door->key = NULL;
 				door->stop_command = NULL;
 				door->stop_command6 = NULL;
 				door->flag_fin = DONT_CARE;
@@ -725,6 +998,28 @@ int parseconfig(char *configfile)
 					} else if(!strcmp(key, "CMD_TIMEOUT")) {
 						door->cmd_timeout = (time_t)atoi(ptr);
 						dprint("config: %s: cmd_timeout: %d\n", door->name, door->cmd_timeout);
+					} else if(!strcmp(key, "KEY")) {
+						door->key = malloc(sizeof(char) * (strlen(ptr)+1));
+						if(door->key == NULL) {
+							perror("malloc");
+							exit(1);
+						}
+						strcpy(door->key, ptr);
+						dprint("config: %s: key: %s\n", door->name, door->key);
+						char *totpsecret = malloc(sizeof(char) * (strlen(door->key)+1));
+						strcpy(totpsecret, door->key);
+						char *totp;
+						totp = generate_totp(totpsecret);
+						char *totp_str = malloc(sizeof(char) * (strlen(door->key)+1));
+						split_number_string(totp, totp_str);
+			
+						int i;
+						i = parse_port_sequence(totp_str, door);
+						if(i > 0) {
+							return(i);
+						}
+						dprint_sequence(door, "config: %s: sequence: ", door->name);
+
 					} else if(!strcmp(key, "STOP_COMMAND")) {
 						door->stop_command = malloc(sizeof(char) * (strlen(ptr)+1));
 						if(door->stop_command == NULL) {
@@ -792,8 +1087,10 @@ int parseconfig(char *configfile)
 	for(lp = doors; lp; lp = lp->next) {
 		door = (opendoor_t*)lp->data;
 		if(door->seqcount == 0) {
-			fprintf(stderr, "error: section '%s' has an empty knock sequence\n", door->name);
-			return(1);
+			if (door->key == 0) {
+				fprintf(stderr, "error: section '%s' has an empty knock sequence and no TOTP key\n", door->name);
+				return(1);
+			}
 		}
 	}
 
@@ -1017,20 +1314,67 @@ void generate_pcap_filter()
 			bufsize = realloc_strcat(&buffer, ") and (", bufsize);
 			head_set = 0;
 
-			/* generate filter for all TCP ports (i.e. "((tcp dst port 4000 or 4001 or 4002) and tcp[tcpflags] & tcp-syn != 0)" */
-			for(i = 0; i < door->seqcount; i++) {
-				if(door->protocol[i] == IPPROTO_TCP) {
-					if(!head_set) {		/* first TCP port in the sequence */
-						bufsize = realloc_strcat(&buffer, "((tcp dst port ", bufsize);
-						head_set = 1;
-						tcp_present = 1;
-					} else {		/* not the first TCP port in the sequence */
-						bufsize = realloc_strcat(&buffer, " or ", bufsize);
-					}
-					snprintf(port_str, sizeof(port_str), "%hu", door->sequence[i]);		/* unsigned short to string */
-					bufsize = realloc_strcat(&buffer, port_str, bufsize);			/* append port number */
+			if(door->seqcount == 0) {
+				if (door->key == 0) {
+					fprintf(stderr, "error: section '%s' has an empty knock sequence and no TOTP key\n", door->name);
+					return(1);
 				}
 			}
+
+			// print value of door->seqcount
+			// fprintf(stderr, "Door %s has %d sequences\n", door->name, door->seqcount);
+			// fprintf("Door %s has %d sequences\n", door->name, door->seqcount);
+			if(door->seqcount > 0) {
+				/* generate filter for all TCP ports (i.e. "((tcp dst port 4000 or 4001 or 4002) and tcp[tcpflags] & tcp-syn != 0)" */
+				// fprintf(stderr, "Generating filter for predefined TCP ports\n");
+				for(i = 0; i < door->seqcount; i++) {
+					if(door->protocol[i] == IPPROTO_TCP) {
+						if(!head_set) {		/* first TCP port in the sequence */
+							bufsize = realloc_strcat(&buffer, "((tcp dst port ", bufsize);
+							head_set = 1;
+							tcp_present = 1;
+						} else {		/* not the first TCP port in the sequence */
+							bufsize = realloc_strcat(&buffer, " or ", bufsize);
+						}
+						snprintf(port_str, sizeof(port_str), "%hu", door->sequence[i]);		/* unsigned short to string */
+						bufsize = realloc_strcat(&buffer, port_str, bufsize);			/* append port number */
+					}
+				}
+
+			} else {
+				char *totpsecret = malloc(sizeof(char) * (strlen(door->key)+1));
+				strcpy(totpsecret, door->key);
+				char *totp;
+				totp = generate_totp(totpsecret);
+				uint32_t *first;
+				uint32_t *second;
+				split_number(totp, &first, &second);
+				char *first_str = malloc(sizeof(char) * (strlen(door->key)+1));
+				char *second_str = malloc(sizeof(char) * (strlen(door->key)+1));
+				snprintf(first_str, sizeof(char) * (strlen(door->key) + 1), "%d", first);
+				snprintf(second_str, sizeof(char) * (strlen(door->key) + 1), "%d", second);
+
+				if(!head_set) {		/* first TCP port in the sequence */
+					bufsize = realloc_strcat(&buffer, "((tcp dst port ", bufsize);
+					head_set = 1;
+					tcp_present = 1;
+				} else {		/* not the first TCP port in the sequence */
+					bufsize = realloc_strcat(&buffer, " or ", bufsize);
+				}
+				snprintf(port_str, sizeof(port_str), "%hu", first);		/* unsigned short to string */
+				bufsize = realloc_strcat(&buffer, port_str, bufsize);			/* append port number */
+
+				if(!head_set) {		/* first TCP port in the sequence */
+					bufsize = realloc_strcat(&buffer, "((tcp dst port ", bufsize);
+					head_set = 1;
+					tcp_present = 1;
+				} else {		/* not the first TCP port in the sequence */
+					bufsize = realloc_strcat(&buffer, " or ", bufsize);
+				}
+				snprintf(port_str, sizeof(port_str), "%hu", second);		/* unsigned short to string */
+				bufsize = realloc_strcat(&buffer, port_str, bufsize);			/* append port number */
+			}
+
 			if(tcp_present) {
 				bufsize = realloc_strcat(&buffer, ")", bufsize);		/* close parentheses of TCP ports */
 			}
